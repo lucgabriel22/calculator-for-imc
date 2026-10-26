@@ -14,14 +14,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from rich.console import Console
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.text import Text
-
 from fortigate_audit.https import probe_https
 from fortigate_audit.models import Result, Target
 from fortigate_audit.planilha import load_targets
-from fortigate_audit.terminal import show_header, show_results, show_targets
+from fortigate_audit.terminal import Console, Progress, show_header, show_results, show_targets
 
 
 def parse_ports(value: str) -> tuple[int, ...]:
@@ -72,6 +68,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ca", type=Path, help="CA adicional em PEM para validar certificados privados.")
     parser.add_argument("--origem", default="Não informada", help="Descrição da conexão de teste exibida no terminal.")
     parser.add_argument("--listar", action="store_true", help="Mostra os alvos lidos, sem resolver DNS ou acessar a rede.")
+    parser.add_argument("--ignorar-invalidos", action="store_true", help="Processa apenas as linhas válidas e avisa cada linha ignorada; por padrão, erros interrompem a leitura.")
     return parser.parse_args(argv)
 
 
@@ -92,12 +89,8 @@ def scan(targets: list[Target], ports: tuple[int, ...], timeout: float,
     results: list[Result] = []
     endpoints: list[tuple[Target, str, int]] = []
     # DNS é feito antes das conexões. Depois, cada socket usa exatamente o IP relatado.
-    with Progress(
-        SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
-        MofNCompleteColumn(), TimeElapsedColumn(),
-        console=console, transient=True, disable=not console.is_terminal,
-    ) as progress, ThreadPoolExecutor(max_workers=workers) as pool:
-        task = progress.add_task("Resolvendo destinos", total=len(targets))
+    with Progress(console) as progress, ThreadPoolExecutor(max_workers=workers) as pool:
+        progress.update("Resolvendo destinos", total=len(targets))
         resolutions = {pool.submit(resolve_ips, target.address): target for target in targets}
         for future in as_completed(resolutions):
             target = resolutions[future]
@@ -107,12 +100,12 @@ def scan(targets: list[Target], ports: tuple[int, ...], timeout: float,
                 for port in ports:
                     results.append(Result(target.host, "não resolvido", port, "DNS_ERROR",
                                           f"Não foi possível resolver {target.address}."))
-                progress.advance(task)
+                progress.advance()
                 continue
             endpoints.extend((target, ip, port) for ip in ips for port in ports)
-            progress.advance(task)
+            progress.advance()
 
-        progress.update(task, description="Consultando HTTPS", completed=0, total=len(endpoints))
+        progress.update("Consultando HTTPS", completed=0, total=len(endpoints))
         futures = {
             pool.submit(probe_https, target, ip, port, timeout, context): (target, ip, port)
             for target, ip, port in endpoints
@@ -120,24 +113,27 @@ def scan(targets: list[Target], ports: tuple[int, ...], timeout: float,
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
-            progress.advance(task)
+            progress.advance()
     return sorted(results, key=lambda item: (item.host.casefold(), item.ip, item.port))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = arguments(argv)
     started = datetime.now().astimezone()
-    console = Console(highlight=False, color_system="auto" if sys.stdout.isatty() else None)
+    console = Console()
     try:
         if any(ord(char) < 32 or ord(char) == 127 for char in args.origem):
             raise ValueError("A descrição da origem não pode conter caracteres de controle.")
         with warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
-            targets = load_targets(args.planilha, args.aba, args.coluna_host, args.coluna_ip)
+            targets = load_targets(args.planilha, args.aba, args.coluna_host, args.coluna_ip,
+                                   skip_invalid=args.ignorar_invalidos)
         notices = [str(warning.message) for warning in recorded]
         show_header(console, args.planilha, args.origem, args.portas, len(targets))
         for notice in notices:
-            console.print(Text(f"AVISO: {notice}", style="yellow"))
+            console.print(f"AVISO: {notice}", style="yellow")
+        if args.ignorar_invalidos and notices:
+            console.print(f"Atenção: {len(notices)} aviso(s) de leitura; confira as linhas e abas ignoradas.", style="yellow")
         if args.listar:
             show_targets(console, targets)
             return 0
@@ -150,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         show_results(console, results, started)
         return 0
     except (ValueError, OSError, ssl.SSLError) as exc:
-        Console(stderr=True, highlight=False).print(Text(f"Erro: {exc}", style="bold red"))
+        Console(stderr=True).print(f"Erro: {exc}", style="bold red")
         return 2
 
 

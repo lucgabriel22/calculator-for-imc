@@ -4,8 +4,9 @@ from pathlib import Path
 import re
 import warnings
 from zipfile import ZipFile
+from xml.etree import ElementTree as ET
 
-from openpyxl import Workbook
+from xlsx_fixture import Workbook
 
 from fortigate_audit.planilha import PlanilhaWarning, load_targets
 
@@ -194,6 +195,110 @@ class PlanilhaTests(unittest.TestCase):
         targets = load_targets(self.path)
         self.assertEqual([target.address for target in targets], ["192.0.2.1", "192.0.2.2"])
         self.assertEqual(targets[0].source, "Sheet:linha 21")
+
+    def test_invalid_rows_are_only_skipped_with_explicit_option(self):
+        sheet = self.workbook.active
+        sheet.append(["Host", "IP"])
+        sheet.append(["Válido", "192.0.2.1"])
+        sheet.append(["Inválido", 192002001])
+        sheet.append(["Inválido URL", "https://example.com/"])
+        self.save()
+        with self.assertRaisesRegex(ValueError, "linha 3"):
+            load_targets(self.path)
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter("always")
+            targets = load_targets(self.path, skip_invalid=True)
+        self.assertEqual([target.address for target in targets], ["192.0.2.1"])
+        self.assertEqual(len(notices), 2)
+        self.assertIn("linha 3", str(notices[0].message))
+        self.assertIn("linha 4", str(notices[1].message))
+
+    def test_shared_rich_strings_ignore_phonetic_annotations(self):
+        sheet = self.workbook.active
+        sheet.append(["Host", "IP"])
+        sheet.append(["placeholder", "192.0.2.1"])
+        self.save()
+        with ZipFile(self.path) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        contents["xl/worksheets/sheet1.xml"] = contents["xl/worksheets/sheet1.xml"].replace(
+            b'<c r="A2" t="inlineStr"><is><t>placeholder</t></is></c>',
+            b'<c r="A2" t="s"><v>0</v></c>',
+        )
+        contents["xl/sharedStrings.xml"] = (
+            b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            b'<si><r><t>Loja </t></r><r><t>central</t></r><rPh sb="0" eb="2"><t>phonetic</t></rPh></si></sst>'
+        )
+        contents["xl/_rels/workbook.xml.rels"] = contents["xl/_rels/workbook.xml.rels"].replace(
+            b'</Relationships>',
+            b'<Relationship Id="strings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="/xl/sharedStrings.xml"/></Relationships>',
+        )
+        with ZipFile(self.path, "w") as archive:
+            for name, content in contents.items():
+                archive.writestr(name, content)
+        targets = load_targets(self.path)
+        self.assertEqual(targets[0].host, "Loja central")
+
+    def test_worksheet_relationship_path_is_resolved_without_extraction(self):
+        sheet = self.workbook.active
+        sheet.append(["Host", "IP"])
+        sheet.append(["Filial", "192.0.2.1"])
+        self.save()
+        with ZipFile(self.path) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        contents["data/renamed.xml"] = contents.pop("xl/worksheets/sheet1.xml")
+        contents["xl/_rels/workbook.xml.rels"] = contents["xl/_rels/workbook.xml.rels"].replace(
+            b'Target="worksheets/sheet1.xml"', b'Target="../data/renamed.xml"',
+        )
+        with ZipFile(self.path, "w") as archive:
+            for name, content in contents.items():
+                archive.writestr(name, content)
+        self.assertEqual(load_targets(self.path)[0].address, "192.0.2.1")
+
+    def test_external_worksheet_is_rejected_without_network(self):
+        sheet = self.workbook.active
+        sheet.append(["Host", "IP"])
+        sheet.append(["Filial", "192.0.2.1"])
+        self.save()
+        with ZipFile(self.path) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        contents["xl/_rels/workbook.xml.rels"] = contents["xl/_rels/workbook.xml.rels"].replace(
+            b'Target="worksheets/sheet1.xml"', b'TargetMode="External" Target="https://outside.invalid/worksheet.xml"',
+        )
+        with ZipFile(self.path, "w") as archive:
+            for name, content in contents.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "externo"):
+            load_targets(self.path)
+
+    def test_sparse_rows_and_strict_namespaces_preserve_source_positions(self):
+        sheet = self.workbook.active
+        for _ in range(5):
+            sheet.append([])
+        sheet.append([None, None, "Host", "IP"])
+        sheet.append([None, None, "Filial", "192.0.2.1"])
+        self.save()
+        with ZipFile(self.path) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        root = ET.fromstring(contents["xl/worksheets/sheet1.xml"])
+        data = next(node for node in root if node.tag.endswith("sheetData"))
+        for row in list(data):
+            if not list(row):
+                data.remove(row)
+        contents["xl/worksheets/sheet1.xml"] = ET.tostring(root)
+        for path in ("xl/workbook.xml", "xl/worksheets/sheet1.xml", "xl/_rels/workbook.xml.rels"):
+            contents[path] = contents[path].replace(
+                b"http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                b"http://purl.oclc.org/ooxml/spreadsheetml/main",
+            ).replace(
+                b"http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                b"http://purl.oclc.org/ooxml/officeDocument/relationships",
+            )
+        with ZipFile(self.path, "w") as archive:
+            for name, content in contents.items():
+                archive.writestr(name, content)
+        targets = load_targets(self.path)
+        self.assertEqual(targets[0].source, "Sheet:linha 7")
+        self.assertEqual(targets[0].address, "192.0.2.1")
 
 
 if __name__ == "__main__":

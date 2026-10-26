@@ -14,7 +14,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from openpyxl import Workbook
+from xlsx_fixture import Workbook
 
 from verificar_fortigate import main
 
@@ -80,7 +80,7 @@ class CLITests(unittest.TestCase):
         environment = os.environ.copy()
         environment["COLUMNS"] = "140"
         return subprocess.run(
-            [sys.executable, str(ROOT / "verificar_fortigate.py"), str(self.path), *args],
+            [sys.executable, "-S", str(ROOT / "verificar_fortigate.py"), str(self.path), *args],
             text=True, capture_output=True, timeout=15, cwd=self.directory.name,
             env=environment,
         )
@@ -108,8 +108,8 @@ class CLITests(unittest.TestCase):
         self.assertIn("FortiGate provável", output)
         self.assertIn(str(refused_port), output)
         self.assertIn("Conexão recusada", output)
-        self.assertRegex(output, r"Verificações\s*[:│]?\s*2\b")
-        self.assertRegex(output, r"Web acessível\s*[:│]?\s*1\b")
+        self.assertRegex(output, r"Verificações\s*[:│|]?\s*2\b")
+        self.assertRegex(output, r"Web acessível\s*[:│|]?\s*1\b")
         self.assertIn("local-in policy não é verificável externamente", output)
         self.assertNotIn("\x1b[", output)
         self.assert_no_generated_files(previous_files)
@@ -120,8 +120,8 @@ class CLITests(unittest.TestCase):
         completed = self.run_cli("--portas", str(self.server.server_port))
         self.assertEqual(completed.returncode, 0, completed.stderr)
         output = completed.stdout
-        self.assertRegex(output, r"Web acessível\s*[:│]?\s*0\b")
-        self.assertRegex(output, r"TLS sem validação\s*[:│]?\s*1\b")
+        self.assertRegex(output, r"Web acessível\s*[:│|]?\s*0\b")
+        self.assertRegex(output, r"TLS sem validação\s*[:│|]?\s*1\b")
         self.assertIn("TLS RESPONDEU", output)
         self.assertIn("Certificado não validado", output)
         self.assertNotIn("Conexão recusada", output)
@@ -178,10 +178,45 @@ class CLITests(unittest.TestCase):
             code = main([str(self.path)])
         self.assertEqual(code, 0)
         output = captured.getvalue()
-        self.assertRegex(output, r"Verificações\s*[:│]?\s*6\b")
+        self.assertRegex(output, r"Verificações\s*[:│|]?\s*6\b")
         self.assertEqual(output.count("Produto não confirmado"), 6)
         self.assertEqual(output.count("192.0.2.1"), 3)
         self.assertEqual(output.count("2001:db8::1"), 3)
+        self.assertFalse(self.output.exists())
+
+    def test_help_runs_without_site_packages(self):
+        completed = self.run_cli("--help")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--ignorar-invalidos", completed.stdout)
+        self.assertIn("--listar", completed.stdout)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_explicit_skip_invalid_warns_and_scans_only_valid_row(self):
+        from fortigate_audit.models import Result
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Host", "IP"])
+        sheet.append(["fw.test", "127.0.0.1"])
+        sheet.append(["Linha inválida", 123])
+        workbook.save(self.path)
+        workbook.close()
+
+        def result(target, ip, port, timeout, context):
+            return Result(target.host, ip, port, "WEB", "fixture", 403)
+
+        with patch("verificar_fortigate.probe_https", side_effect=result) as probe, \
+             patch.dict(os.environ, {"COLUMNS": "140"}), redirect_stdout(StringIO()) as captured:
+            code = main([str(self.path), "--ignorar-invalidos"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(probe.call_count, 3)
+        self.assertTrue(all(call.args[0].host == "fw.test" for call in probe.call_args_list))
+        self.assertTrue(all(call.args[1] == "127.0.0.1" for call in probe.call_args_list))
+        output = captured.getvalue()
+        self.assertIn("linha 3", output)
+        self.assertIn("linha ignorada", output)
+        self.assertRegex(output, r"Verificações\s*[:│|]?\s*3\b")
         self.assertFalse(self.output.exists())
 
     def test_corrupt_xlsx_returns_readable_error_without_traceback(self):
